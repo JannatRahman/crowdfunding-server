@@ -546,13 +546,16 @@ app.patch('/api/contributions/:id/approve', authMiddleware, async (req, res) => 
       }
     );
 
-    // Generate a notification for the supporter
+    // Generate a notification for the supporter (new toEmail schema)
+    const campaignTitleApprove = campaign.campaignTitle || campaign.title || 'the campaign';
+    const creatorNameApprove = campaign.creatorName || req.user.name || 'the creator';
+    const supporterEmailApprove = contribution.supporterEmail || contribution.Supporter_email || '';
     await db.collection("notifications").insertOne({
-      userId: contribution.supporterId,
-      title: "Contribution Approved",
-      message: `Your contribution of $${contributionAmount} to "${campaign.campaignTitle || campaign.title}" has been approved!`,
+      message: `Your Contribution of ${contributionAmount} credits to ${campaignTitleApprove} was approved by ${creatorNameApprove}`,
+      toEmail: supporterEmailApprove,
+      actionRoute: "/dashboard/supporter/contributions",
+      time: new Date(),
       read: false,
-      createdAt: new Date()
     });
 
     res.json({ success: true, message: 'Contribution approved successfully' });
@@ -608,13 +611,16 @@ app.patch('/api/contributions/:id/reject', authMiddleware, async (req, res) => {
       } catch (e) {}
     }
 
-    // Generate a notification for the supporter
+    // Generate a notification for the supporter (new toEmail schema)
+    const campaignTitleReject = campaign.campaignTitle || campaign.title || 'the campaign';
+    const creatorNameReject = campaign.creatorName || req.user.name || 'the creator';
+    const supporterEmailReject = contribution.supporterEmail || contribution.Supporter_email || '';
     await db.collection("notifications").insertOne({
-      userId: contribution.supporterId,
-      title: "Contribution Rejected",
-      message: `Your contribution of $${refundAmount} to "${campaign.campaignTitle || campaign.title}" was rejected. The credits have been refunded.`,
+      message: `Your Contribution of ${refundAmount} credits to ${campaignTitleReject} was rejected by ${creatorNameReject}. Credits have been refunded to your account.`,
+      toEmail: supporterEmailReject,
+      actionRoute: "/dashboard/supporter/contributions",
+      time: new Date(),
       read: false,
-      createdAt: new Date()
     });
 
     res.json({ success: true, message: 'Contribution rejected and refunded successfully' });
@@ -624,13 +630,15 @@ app.patch('/api/contributions/:id/reject', authMiddleware, async (req, res) => {
   }
 });
 
-// Notifications Endpoint
+// Notifications Endpoint — query by toEmail matching the logged-in user's email
 app.get('/api/notifications', authMiddleware, async (req, res) => {
   try {
-    const userId = req.user._id.toString();
-    const notifications = await db.collection("notifications").find({ userId })
-      .sort({ _id: -1 }).limit(10).toArray();
-    const unread = await db.collection("notifications").countDocuments({ userId, read: false });
+    const userEmail = req.user.email;
+    const notifications = await db.collection("notifications")
+      .find({ toEmail: userEmail })
+      .sort({ time: -1, _id: -1 })
+      .toArray();
+    const unread = await db.collection("notifications").countDocuments({ toEmail: userEmail, read: false });
     res.json({ notifications, unread });
   } catch (err) {
     res.json({ notifications: [], unread: 0 });
@@ -652,7 +660,7 @@ app.patch('/api/notifications/:id/read', authMiddleware, async (req, res) => {
 app.patch('/api/notifications/read-all', authMiddleware, async (req, res) => {
   try {
     await db.collection("notifications").updateMany(
-      { userId: req.user._id.toString(), read: false },
+      { toEmail: req.user.email, read: false },
       { $set: { read: true } }
     );
     res.json({ success: true });
@@ -870,6 +878,15 @@ app.post('/api/payments/create-session', authMiddleware, async (req, res) => {
     };
 
     await contributionCollection.insertOne(contr);
+
+    // Notify the campaign creator about the new contribution
+    await db.collection("notifications").insertOne({
+      message: `${req.user.name} made a new Contribution of ${finalAmount} credits to your campaign "${finalCampaignTitle}"`,
+      toEmail: creatorEmail,
+      actionRoute: "/dashboard/creator/campaigns",
+      time: new Date(),
+      read: false,
+    });
     
     // Deduct credits from user immediately
     let updateResult = null;
@@ -973,19 +990,16 @@ app.patch('/api/withdrawals/:id/approve', authMiddleware, async (req, res) => {
       }
     }
 
-    // Notify the creator
+    // Notify the creator (new toEmail schema)
     if (creatorEmail) {
-      const creator = await userCollection.findOne({ email: creatorEmail });
-      if (creator) {
-        const usdAmount = withdrawal.withdrawal_amount || (creditsToDeduct / 20);
-        await db.collection('notifications').insertOne({
-          userId: creator._id.toString(),
-          title: 'Withdrawal Payment Sent 💰',
-          message: `Your withdrawal of ${creditsToDeduct} credits ($${usdAmount.toFixed(2)}) has been processed successfully via ${withdrawal.payment_system || 'your payment method'}.`,
-          read: false,
-          createdAt: new Date(),
-        });
-      }
+      const usdAmount = withdrawal.withdrawal_amount || (creditsToDeduct / 20);
+      await db.collection('notifications').insertOne({
+        message: `Your withdrawal of ${creditsToDeduct} credits ($${Number(usdAmount).toFixed(2)}) has been approved by Admin via ${withdrawal.payment_system || 'your payment method'}`,
+        toEmail: creatorEmail,
+        actionRoute: "/dashboard/creator/withdrawals",
+        time: new Date(),
+        read: false,
+      });
     }
 
     res.json({ success: true, message: 'Withdrawal approved and credits deducted from creator' });
@@ -1099,19 +1113,16 @@ app.patch('/api/admin/campaigns/:id/approve', authMiddleware, async (req, res) =
       { $set: { status: 'approved', updatedAt: new Date() } }
     );
 
-    // Notify the creator
+    // Notify the creator (new toEmail schema)
     const creatorEmail = campaign.creatorEmail;
     if (creatorEmail) {
-      const creator = await userCollection.findOne({ email: creatorEmail });
-      if (creator) {
-        await db.collection('notifications').insertOne({
-          userId: creator._id.toString(),
-          title: 'Campaign Approved 🎉',
-          message: `Your campaign "${campaign.campaignTitle || campaign.title}" has been approved and is now visible to supporters!`,
-          read: false,
-          createdAt: new Date(),
-        });
-      }
+      await db.collection('notifications').insertOne({
+        message: `Your campaign "${campaign.campaignTitle || campaign.title}" has been approved by Admin and is now live for supporters!`,
+        toEmail: creatorEmail,
+        actionRoute: "/dashboard/creator/campaigns",
+        time: new Date(),
+        read: false,
+      });
     }
 
     res.json({ success: true, message: 'Campaign approved successfully' });
@@ -1134,20 +1145,17 @@ app.patch('/api/admin/campaigns/:id/reject', authMiddleware, async (req, res) =>
       { $set: { status: 'rejected', updatedAt: new Date() } }
     );
 
-    // Notify the creator
+    // Notify the creator (new toEmail schema)
     const creatorEmail = campaign.creatorEmail;
     if (creatorEmail) {
-      const creator = await userCollection.findOne({ email: creatorEmail });
-      if (creator) {
-        const reasonText = reason ? ` Reason: ${reason}` : '';
-        await db.collection('notifications').insertOne({
-          userId: creator._id.toString(),
-          title: 'Campaign Rejected',
-          message: `Your campaign "${campaign.campaignTitle || campaign.title}" was rejected by the admin.${reasonText} Please review and resubmit.`,
-          read: false,
-          createdAt: new Date(),
-        });
-      }
+      const reasonText = reason ? ` Reason: ${reason}` : '';
+      await db.collection('notifications').insertOne({
+        message: `Your campaign "${campaign.campaignTitle || campaign.title}" was rejected by Admin.${reasonText} Please review and resubmit.`,
+        toEmail: creatorEmail,
+        actionRoute: "/dashboard/creator/campaigns",
+        time: new Date(),
+        read: false,
+      });
     }
 
     res.json({ success: true, message: 'Campaign rejected and creator notified' });
