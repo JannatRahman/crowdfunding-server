@@ -392,6 +392,71 @@ app.delete('/api/campaigns/:id', authMiddleware, async (req, res) => {
   }
 });
 
+// GET /api/contributions/my - Get user's contributions with pagination & stats
+app.get('/api/contributions/my', authMiddleware, async (req, res) => {
+  try {
+    const email = req.user.email;
+    const query = {
+      $or: [
+        { supporterEmail: email },
+        { Supporter_email: email }
+      ]
+    };
+
+    // Calculate user statistics
+    const allUserContributions = await contributionCollection.find(query).toArray();
+    const totalContributions = allUserContributions.length;
+    const totalPendingContributions = allUserContributions.filter(c => c.status === 'pending').length;
+    const totalAmountContributed = allUserContributions
+      .filter(c => c.status === 'approved')
+      .reduce((sum, c) => sum + Number(c.amount || c.Contribution_amount || 0), 0);
+
+    // Support pagination parameters
+    const pageNum = parseInt(req.query.page) || 1;
+    const limitNum = parseInt(req.query.limit) || 10;
+    const skip = (pageNum - 1) * limitNum;
+
+    const paginatedContributions = await contributionCollection.find(query)
+      .sort({ _id: -1 })
+      .skip(skip)
+      .limit(limitNum)
+      .toArray();
+
+    // Map contributions to ensure they contain campaign details populated if needed by standard format
+    const contributionsWithCampaigns = [];
+    for (let c of paginatedContributions) {
+      let campaign = null;
+      if (c.campaignId) {
+        try {
+          campaign = await campaignCollection.findOne({ _id: new ObjectId(c.campaignId) });
+        } catch (err) {}
+      }
+      contributionsWithCampaigns.push({
+        ...c,
+        campaign: campaign ? mapCampaign(campaign) : null
+      });
+    }
+
+    res.json({
+      contributions: contributionsWithCampaigns,
+      stats: {
+        totalContributions,
+        totalPendingContributions,
+        totalAmountContributed
+      },
+      pagination: {
+        page: pageNum,
+        limit: limitNum,
+        total: totalContributions,
+        pages: Math.ceil(totalContributions / limitNum) || 1
+      }
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error fetching my contributions' });
+  }
+});
+
 // GET /api/contributions/pending - Get pending contributions for creator's campaigns
 app.get('/api/contributions/pending', authMiddleware, async (req, res) => {
   try {
@@ -703,7 +768,8 @@ app.get('/api/payments/history', authMiddleware, async (req, res) => {
         createdAt: w.withdraw_date,
         status: w.status,
         paymentSystem: w.payment_system,
-        accountNumber: w.account_number
+        accountNumber: w.account_number,
+        credits: w.withdrawal_credit
       }));
       res.json(mapped);
     } else {
@@ -759,22 +825,47 @@ app.post('/api/payments/purchase-credit', authMiddleware, async (req, res) => {
 });
 
 app.post('/api/payments/create-session', authMiddleware, async (req, res) => {
-  const { campaignId, amount, message, anonymous } = req.body;
+  const { campaignId, amount, Contribution_amount, message, anonymous } = req.body;
   try {
+    const finalAmount = Number(Contribution_amount !== undefined ? Contribution_amount : amount);
+    if (!finalAmount || finalAmount <= 0) {
+      return res.status(400).json({ error: 'Invalid contribution amount' });
+    }
+
     const campaign = await campaignCollection.findOne({ _id: new ObjectId(campaignId) });
+    if (!campaign) {
+      return res.status(404).json({ error: 'Campaign not found' });
+    }
+
+    const creatorName = campaign.creatorName || 'Emily Johnson';
+    const creatorEmail = campaign.creatorEmail || 'emily@example.com';
+    const finalCampaignTitle = campaign.campaignTitle || campaign.title || 'Campaign';
+
     const contr = {
+      // Standard keys
       supporterId: req.user._id.toString(),
       supporterName: req.user.name,
       supporterEmail: req.user.email,
       campaignId,
-      campaignTitle: campaign?.campaignTitle || campaign?.title || 'Campaign',
-      amount,
-      message,
-      anonymous,
+      campaignTitle: finalCampaignTitle,
+      amount: finalAmount,
+      message: message || '',
+      anonymous: !!anonymous,
       status: 'pending',
       createdAt: new Date(),
-      updatedAt: new Date()
+      updatedAt: new Date(),
+
+      // Exact prompt keys
+      campaign_id: campaignId,
+      campaign_title: finalCampaignTitle,
+      Contribution_amount: finalAmount,
+      Supporter_email: req.user.email,
+      Supporter_name: req.user.name,
+      creator_name: creatorName,
+      creator_email: creatorEmail,
+      current_date: new Date()
     };
+
     await contributionCollection.insertOne(contr);
     
     // Deduct credits from user immediately
@@ -782,7 +873,7 @@ app.post('/api/payments/create-session', authMiddleware, async (req, res) => {
     try {
       updateResult = await userCollection.updateOne(
         { _id: req.user._id },
-        { $inc: { credits: -amount } }
+        { $inc: { credits: -finalAmount } }
       );
     } catch (e) {}
 
@@ -790,13 +881,14 @@ app.post('/api/payments/create-session', authMiddleware, async (req, res) => {
       try {
         updateResult = await userCollection.updateOne(
           { _id: new ObjectId(req.user._id) },
-          { $inc: { credits: -amount } }
+          { $inc: { credits: -finalAmount } }
         );
       } catch (e) {}
     }
 
     res.json({ url: '/dashboard/supporter/contributions' }); // redirect to contributions list instead of Stripe URL
   } catch (e) {
+    console.error('Payment session creation failed:', e);
     res.status(500).json({ error: 'Payment failed' });
   }
 });
