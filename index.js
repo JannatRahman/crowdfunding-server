@@ -783,18 +783,20 @@ app.get('/api/payments/history', authMiddleware, async (req, res) => {
 });
 
 app.post('/api/payments/purchase-credit', authMiddleware, async (req, res) => {
-  const { amount } = req.body;
+  const { amount, credits } = req.body;
   try {
-    const purchaseAmount = Number(amount);
-    if (!purchaseAmount || purchaseAmount <= 0) {
+    const usdAmount = Number(amount);
+    if (!usdAmount || usdAmount <= 0) {
       return res.status(400).json({ error: 'Invalid amount' });
     }
+
+    const creditsToPurchase = Number(credits !== undefined ? credits : usdAmount * 10);
 
     let updateResult = null;
     try {
       updateResult = await userCollection.updateOne(
         { _id: req.user._id },
-        { $inc: { credits: purchaseAmount } }
+        { $inc: { credits: creditsToPurchase } }
       );
     } catch (e) {}
 
@@ -802,7 +804,7 @@ app.post('/api/payments/purchase-credit', authMiddleware, async (req, res) => {
       try {
         updateResult = await userCollection.updateOne(
           { _id: new ObjectId(req.user._id) },
-          { $inc: { credits: purchaseAmount } }
+          { $inc: { credits: creditsToPurchase } }
         );
       } catch (e) {}
     }
@@ -811,7 +813,8 @@ app.post('/api/payments/purchase-credit', authMiddleware, async (req, res) => {
     await db.collection("payments").insertOne({
       userId: req.user._id.toString(),
       userName: req.user.name,
-      amount: purchaseAmount,
+      amount: usdAmount,
+      credits: creditsToPurchase,
       type: 'credit_purchase',
       status: 'completed',
       createdAt: new Date()
