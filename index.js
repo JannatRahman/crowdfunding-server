@@ -896,6 +896,607 @@ app.post('/api/payments/create-session', authMiddleware, async (req, res) => {
   }
 });
 
+// ──────────────────────────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────────────
+// ADMIN ROUTES
+// ──────────────────────────────────────────────────────────────────────────────
+
+// GET /api/withdrawals/pending — All pending withdrawal requests (Admin only)
+app.get('/api/withdrawals/pending', authMiddleware, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 50;
+    const skip = (page - 1) * limit;
+
+    const total = await db.collection('withdrawals').countDocuments({ status: 'pending' });
+    const withdrawals = await db.collection('withdrawals')
+      .find({ status: 'pending' })
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .toArray();
+
+    res.json({
+      withdrawals,
+      pagination: {
+        page,
+        limit,
+        total,
+        pages: Math.ceil(total / limit) || 1,
+      }
+    });
+  } catch (err) {
+    console.error('Pending withdrawals error:', err);
+    res.status(500).json({ error: 'Server error fetching pending withdrawals' });
+  }
+});
+
+// PATCH /api/withdrawals/:id/approve — Mark withdrawal as approved & deduct credits from creator
+app.patch('/api/withdrawals/:id/approve', authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { adminNote } = req.body;
+
+    const withdrawal = await db.collection('withdrawals').findOne({ _id: new ObjectId(id) });
+    if (!withdrawal) return res.status(404).json({ error: 'Withdrawal not found' });
+    if (withdrawal.status !== 'pending') {
+      return res.status(400).json({ error: 'Withdrawal is not pending' });
+    }
+
+    const creditsToDeduct = Number(withdrawal.withdrawal_credit || 0);
+    const creatorEmail = withdrawal.creator_email;
+
+    // Mark the withdrawal as approved
+    await db.collection('withdrawals').updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { status: 'approved', adminNote: adminNote || '', updatedAt: new Date() } }
+    );
+
+    // Deduct the withdrawal credits from the creator's campaigns (reduce currentAmount)
+    // We spread the deduction proportionally across campaigns that have raised funds,
+    // starting from the most-funded, until the full amount is deducted.
+    if (creditsToDeduct > 0 && creatorEmail) {
+      const campaigns = await campaignCollection
+        .find({ creatorEmail, currentAmount: { $gt: 0 } })
+        .sort({ currentAmount: -1 })
+        .toArray();
+
+      let remaining = creditsToDeduct;
+      for (const camp of campaigns) {
+        if (remaining <= 0) break;
+        const deduct = Math.min(remaining, camp.currentAmount || 0);
+        await campaignCollection.updateOne(
+          { _id: camp._id },
+          { $inc: { currentAmount: -deduct, amountRaised: -deduct } }
+        );
+        remaining -= deduct;
+      }
+    }
+
+    // Notify the creator
+    if (creatorEmail) {
+      const creator = await userCollection.findOne({ email: creatorEmail });
+      if (creator) {
+        const usdAmount = withdrawal.withdrawal_amount || (creditsToDeduct / 20);
+        await db.collection('notifications').insertOne({
+          userId: creator._id.toString(),
+          title: 'Withdrawal Payment Sent 💰',
+          message: `Your withdrawal of ${creditsToDeduct} credits ($${usdAmount.toFixed(2)}) has been processed successfully via ${withdrawal.payment_system || 'your payment method'}.`,
+          read: false,
+          createdAt: new Date(),
+        });
+      }
+    }
+
+    res.json({ success: true, message: 'Withdrawal approved and credits deducted from creator' });
+  } catch (err) {
+    console.error('Approve withdrawal error:', err);
+    res.status(500).json({ error: 'Server error approving withdrawal' });
+  }
+});
+
+// PATCH /api/withdrawals/:id/reject — Reject a withdrawal request
+app.patch('/api/withdrawals/:id/reject', authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { adminNote } = req.body;
+
+    const withdrawal = await db.collection('withdrawals').findOne({ _id: new ObjectId(id) });
+    if (!withdrawal) return res.status(404).json({ error: 'Withdrawal not found' });
+    if (withdrawal.status !== 'pending') {
+      return res.status(400).json({ error: 'Withdrawal is not pending' });
+    }
+
+    await db.collection('withdrawals').updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { status: 'rejected', adminNote: adminNote || '', updatedAt: new Date() } }
+    );
+
+    // Notify the creator
+    const creatorEmail = withdrawal.creator_email;
+    if (creatorEmail) {
+      const creator = await userCollection.findOne({ email: creatorEmail });
+      if (creator) {
+        const noteText = adminNote ? ` Reason: ${adminNote}` : '';
+        await db.collection('notifications').insertOne({
+          userId: creator._id.toString(),
+          title: 'Withdrawal Request Rejected',
+          message: `Your withdrawal request of ${withdrawal.withdrawal_credit} credits was rejected.${noteText} Please contact support if you have questions.`,
+          read: false,
+          createdAt: new Date(),
+        });
+      }
+    }
+
+    res.json({ success: true, message: 'Withdrawal rejected' });
+  } catch (err) {
+    console.error('Reject withdrawal error:', err);
+    res.status(500).json({ error: 'Server error rejecting withdrawal' });
+  }
+});
+
+
+// GET /api/admin/stats — 4 key platform statistics for the Admin Home page
+app.get('/api/admin/stats', authMiddleware, async (req, res) => {
+  try {
+    // Count supporters (role === 'supporter')
+    const totalSupporters = await userCollection.countDocuments({ role: 'supporter' });
+
+    // Count creators (role === 'creator')
+    const totalCreators = await userCollection.countDocuments({ role: 'creator' });
+
+    // Sum of all users' credits
+    const creditAgg = await userCollection.aggregate([
+      { $group: { _id: null, total: { $sum: '$credits' } } }
+    ]).toArray();
+    const totalAvailableCredits = creditAgg.length > 0 ? (creditAgg[0].total || 0) : 0;
+
+    // Total payments processed (sum of all payment amounts)
+    const paymentAgg = await db.collection('payments').aggregate([
+      { $match: { status: 'completed' } },
+      { $group: { _id: null, total: { $sum: '$amount' } } }
+    ]).toArray();
+    const totalPaymentsProcessed = paymentAgg.length > 0 ? (paymentAgg[0].total || 0) : 0;
+
+    res.json({
+      stats: {
+        totalSupporters,
+        totalCreators,
+        totalAvailableCredits,
+        totalPaymentsProcessed,
+      }
+    });
+  } catch (err) {
+    console.error('Admin stats error:', err);
+    res.status(500).json({ error: 'Server error fetching admin stats' });
+  }
+});
+
+// GET /api/admin/campaigns/pending — All campaigns with status === 'pending'
+app.get('/api/admin/campaigns/pending', authMiddleware, async (req, res) => {
+  try {
+    const rawCampaigns = await campaignCollection
+      .find({ status: 'pending' })
+      .sort({ createdAt: -1 })
+      .toArray();
+    const campaigns = rawCampaigns.map(mapCampaign);
+    res.json({ campaigns });
+  } catch (err) {
+    console.error('Pending campaigns error:', err);
+    res.status(500).json({ error: 'Server error fetching pending campaigns' });
+  }
+});
+
+// PATCH /api/admin/campaigns/:id/approve — Approve a pending campaign
+app.patch('/api/admin/campaigns/:id/approve', authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const campaign = await campaignCollection.findOne({ _id: new ObjectId(id) });
+    if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
+
+    await campaignCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { status: 'approved', updatedAt: new Date() } }
+    );
+
+    // Notify the creator
+    const creatorEmail = campaign.creatorEmail;
+    if (creatorEmail) {
+      const creator = await userCollection.findOne({ email: creatorEmail });
+      if (creator) {
+        await db.collection('notifications').insertOne({
+          userId: creator._id.toString(),
+          title: 'Campaign Approved 🎉',
+          message: `Your campaign "${campaign.campaignTitle || campaign.title}" has been approved and is now visible to supporters!`,
+          read: false,
+          createdAt: new Date(),
+        });
+      }
+    }
+
+    res.json({ success: true, message: 'Campaign approved successfully' });
+  } catch (err) {
+    console.error('Approve campaign error:', err);
+    res.status(500).json({ error: 'Server error approving campaign' });
+  }
+});
+
+// PATCH /api/admin/campaigns/:id/reject — Reject a pending campaign & notify creator
+app.patch('/api/admin/campaigns/:id/reject', authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { reason } = req.body;
+    const campaign = await campaignCollection.findOne({ _id: new ObjectId(id) });
+    if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
+
+    await campaignCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { status: 'rejected', updatedAt: new Date() } }
+    );
+
+    // Notify the creator
+    const creatorEmail = campaign.creatorEmail;
+    if (creatorEmail) {
+      const creator = await userCollection.findOne({ email: creatorEmail });
+      if (creator) {
+        const reasonText = reason ? ` Reason: ${reason}` : '';
+        await db.collection('notifications').insertOne({
+          userId: creator._id.toString(),
+          title: 'Campaign Rejected',
+          message: `Your campaign "${campaign.campaignTitle || campaign.title}" was rejected by the admin.${reasonText} Please review and resubmit.`,
+          read: false,
+          createdAt: new Date(),
+        });
+      }
+    }
+
+    res.json({ success: true, message: 'Campaign rejected and creator notified' });
+  } catch (err) {
+    console.error('Reject campaign error:', err);
+    res.status(500).json({ error: 'Server error rejecting campaign' });
+  }
+});
+
+// GET /api/admin/users — All users with search, role filter, pagination
+app.get('/api/admin/users', authMiddleware, async (req, res) => {
+  try {
+    const { search = '', role = '', page = 1, limit = 20 } = req.query;
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    const skip = (pageNum - 1) * limitNum;
+
+    const query = {};
+    if (role) query.role = role;
+    if (search) {
+      query.$or = [
+        { name: { $regex: search, $options: 'i' } },
+        { email: { $regex: search, $options: 'i' } },
+      ];
+    }
+
+    const total = await userCollection.countDocuments(query);
+    const rawUsers = await userCollection
+      .find(query)
+      .sort({ createdAt: -1, _id: -1 })
+      .skip(skip)
+      .limit(limitNum)
+      .toArray();
+
+    // Map to safe fields (no password hashes etc.)
+    const users = rawUsers.map(u => ({
+      _id: u._id.toString(),
+      name: u.name || u.displayName || '',
+      email: u.email || '',
+      image: u.image || u.photoURL || u.photo_url || '',
+      role: u.role || 'supporter',
+      credits: u.credits || 0,
+      createdAt: u.createdAt || null,
+    }));
+
+    res.json({
+      users,
+      pagination: {
+        page: pageNum,
+        limit: limitNum,
+        total,
+        pages: Math.ceil(total / limitNum) || 1,
+      },
+    });
+  } catch (err) {
+    console.error('Admin users error:', err);
+    res.status(500).json({ error: 'Server error fetching users' });
+  }
+});
+
+// PATCH /api/admin/users/:id/role — Update a user’s role
+app.patch('/api/admin/users/:id/role', authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { role } = req.body;
+
+    const validRoles = ['admin', 'creator', 'supporter'];
+    if (!validRoles.includes(role)) {
+      return res.status(400).json({ error: 'Invalid role. Must be admin, creator, or supporter.' });
+    }
+
+    let result = null;
+    try {
+      result = await userCollection.updateOne(
+        { _id: id },
+        { $set: { role, updatedAt: new Date() } }
+      );
+    } catch (e) {}
+
+    if (!result || result.matchedCount === 0) {
+      try {
+        result = await userCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { role, updatedAt: new Date() } }
+        );
+      } catch (e) {}
+    }
+
+    if (!result || result.matchedCount === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.json({ success: true, message: `User role updated to ${role}` });
+  } catch (err) {
+    console.error('Update role error:', err);
+    res.status(500).json({ error: 'Server error updating user role' });
+  }
+});
+
+// DELETE /api/admin/users/:id — Delete a user from the database
+app.delete('/api/admin/users/:id', authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    let result = null;
+    try {
+      result = await userCollection.deleteOne({ _id: id });
+    } catch (e) {}
+
+    if (!result || result.deletedCount === 0) {
+      try {
+        result = await userCollection.deleteOne({ _id: new ObjectId(id) });
+      } catch (e) {}
+    }
+
+    if (!result || result.deletedCount === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.json({ success: true, message: 'User deleted successfully' });
+  } catch (err) {
+    console.error('Delete user error:', err);
+    res.status(500).json({ error: 'Server error deleting user' });
+  }
+});
+
+// GET /api/admin/all-campaigns — All campaigns for admin (all statuses, paginated, searchable)
+app.get('/api/admin/all-campaigns', authMiddleware, async (req, res) => {
+  try {
+    const { search = '', status = '', category = '', page = 1, limit = 15 } = req.query;
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    const skip = (pageNum - 1) * limitNum;
+
+    const query = {};
+    if (status) query.status = status;
+    if (category) query.category = { $regex: new RegExp(`^${category}$`, 'i') };
+    if (search) {
+      query.$or = [
+        { title: { $regex: search, $options: 'i' } },
+        { campaignTitle: { $regex: search, $options: 'i' } },
+        { creatorName: { $regex: search, $options: 'i' } },
+        { creatorEmail: { $regex: search, $options: 'i' } },
+      ];
+    }
+
+    const total = await campaignCollection.countDocuments(query);
+    const rawCampaigns = await campaignCollection
+      .find(query)
+      .sort({ createdAt: -1, _id: -1 })
+      .skip(skip)
+      .limit(limitNum)
+      .toArray();
+
+    res.json({
+      campaigns: rawCampaigns.map(mapCampaign),
+      pagination: { page: pageNum, limit: limitNum, total, pages: Math.ceil(total / limitNum) || 1 },
+    });
+  } catch (err) {
+    console.error('Admin all-campaigns error:', err);
+    res.status(500).json({ error: 'Server error fetching campaigns' });
+  }
+});
+
+// DELETE /api/admin/campaigns/:id — Admin force-delete any campaign
+app.delete('/api/admin/campaigns/:id', authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const campaign = await campaignCollection.findOne({ _id: new ObjectId(id) });
+    if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
+
+    // Refund approved backers
+    const approved = await contributionCollection.find({ campaignId: id, status: 'approved' }).toArray();
+    for (const contr of approved) {
+      const refund = Number(contr.amount);
+      let r = null;
+      try { r = await userCollection.updateOne({ _id: contr.supporterId }, { $inc: { credits: refund } }); } catch (e) {}
+      if (!r || r.matchedCount === 0) {
+        try { await userCollection.updateOne({ _id: new ObjectId(contr.supporterId) }, { $inc: { credits: refund } }); } catch (e) {}
+      }
+      await db.collection('notifications').insertOne({
+        userId: contr.supporterId,
+        title: 'Campaign Removed — Credits Refunded',
+        message: `The campaign "${campaign.campaignTitle || campaign.title}" was removed by an admin. Your contribution of $${refund} has been refunded.`,
+        read: false, createdAt: new Date(),
+      });
+    }
+
+    await contributionCollection.updateMany({ campaignId: id }, { $set: { status: 'refunded', updatedAt: new Date() } });
+    await campaignCollection.deleteOne({ _id: new ObjectId(id) });
+
+    res.json({ success: true, message: 'Campaign deleted by admin' });
+  } catch (err) {
+    console.error('Admin delete campaign error:', err);
+    res.status(500).json({ error: 'Server error deleting campaign' });
+  }
+});
+
+// PATCH /api/admin/campaigns/:id/suspend — Suspend a campaign
+app.patch('/api/admin/campaigns/:id/suspend', authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const campaign = await campaignCollection.findOne({ _id: new ObjectId(id) });
+    if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
+
+    await campaignCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { status: 'suspended', updatedAt: new Date() } }
+    );
+
+    // Notify creator
+    if (campaign.creatorEmail) {
+      const creator = await userCollection.findOne({ email: campaign.creatorEmail });
+      if (creator) {
+        await db.collection('notifications').insertOne({
+          userId: creator._id.toString(),
+          title: 'Campaign Suspended',
+          message: `Your campaign "${campaign.campaignTitle || campaign.title}" has been suspended by an admin pending review. Please contact support for more information.`,
+          read: false, createdAt: new Date(),
+        });
+      }
+    }
+
+    res.json({ success: true, message: 'Campaign suspended' });
+  } catch (err) {
+    console.error('Suspend campaign error:', err);
+    res.status(500).json({ error: 'Server error suspending campaign' });
+  }
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Reports
+// ──────────────────────────────────────────────────────────────────────────────
+
+// GET /api/reports — Admin: list all reports with populated campaign & reporter info
+app.get('/api/reports', authMiddleware, async (req, res) => {
+  try {
+    const { status = '', page = 1, limit = 20 } = req.query;
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    const skip = (pageNum - 1) * limitNum;
+
+    const query = {};
+    if (status) query.status = status;
+
+    const total = await db.collection('reports').countDocuments(query);
+    const rawReports = await db.collection('reports')
+      .find(query)
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limitNum)
+      .toArray();
+
+    // Populate campaign title & reporter name
+    const reports = await Promise.all(rawReports.map(async (r) => {
+      let campaignTitle = r.campaignTitle || '';
+      let campaignStatus = '';
+      if (r.campaignId && !campaignTitle) {
+        try {
+          const camp = await campaignCollection.findOne({ _id: new ObjectId(r.campaignId) });
+          if (camp) { campaignTitle = camp.campaignTitle || camp.title || ''; campaignStatus = camp.status; }
+        } catch (e) {}
+      }
+
+      let reporterName = r.reporterName || '';
+      let reporterEmail = r.reporterEmail || '';
+      if (r.reporterId && !reporterName) {
+        try {
+          const user = await userCollection.findOne({ _id: new ObjectId(r.reporterId) });
+          if (user) { reporterName = user.name || ''; reporterEmail = user.email || ''; }
+        } catch (e) {}
+      }
+
+      return {
+        _id: r._id.toString(),
+        campaignId: r.campaignId || '',
+        campaignTitle,
+        campaignStatus,
+        reporterId: r.reporterId || '',
+        reporterName,
+        reporterEmail,
+        reason: r.reason || '',
+        description: r.description || '',
+        status: r.status || 'pending',
+        adminNote: r.adminNote || '',
+        createdAt: r.createdAt || new Date(),
+      };
+    }));
+
+    res.json({
+      reports,
+      pagination: { page: pageNum, limit: limitNum, total, pages: Math.ceil(total / limitNum) || 1 },
+    });
+  } catch (err) {
+    console.error('Get reports error:', err);
+    res.status(500).json({ error: 'Server error fetching reports' });
+  }
+});
+
+// POST /api/reports — Supporter submits a report on a campaign
+app.post('/api/reports', authMiddleware, async (req, res) => {
+  try {
+    const { campaignId, reason, description } = req.body;
+    if (!campaignId || !reason) return res.status(400).json({ error: 'campaignId and reason are required' });
+
+    let campaignTitle = '';
+    try {
+      const camp = await campaignCollection.findOne({ _id: new ObjectId(campaignId) });
+      if (camp) campaignTitle = camp.campaignTitle || camp.title || '';
+    } catch (e) {}
+
+    const report = {
+      campaignId,
+      campaignTitle,
+      reporterId: req.user._id.toString(),
+      reporterName: req.user.name || '',
+      reporterEmail: req.user.email || '',
+      reason,
+      description: description || '',
+      status: 'pending',
+      adminNote: '',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const result = await db.collection('reports').insertOne(report);
+    res.status(201).json({ success: true, _id: result.insertedId });
+  } catch (err) {
+    console.error('Submit report error:', err);
+    res.status(500).json({ error: 'Server error submitting report' });
+  }
+});
+
+// PATCH /api/reports/:id — Admin updates report status
+app.patch('/api/reports/:id', authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, adminNote } = req.body;
+    await db.collection('reports').updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { status, adminNote: adminNote || '', updatedAt: new Date() } }
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Update report error:', err);
+    res.status(500).json({ error: 'Server error updating report' });
+  }
+});
+
 app.listen(port, () => {
   console.log(`Express Server listening on port ${port}`);
 });
