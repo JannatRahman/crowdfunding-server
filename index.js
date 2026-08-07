@@ -2,19 +2,111 @@ const express = require('express');
 const cors = require('cors');
 const { MongoClient, ObjectId } = require('mongodb');
 require('dotenv').config();
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const morgan = require('morgan');
 
 const app = express();
 const port = process.env.PORT || 5000;
+const isProd = process.env.NODE_ENV === 'production';
 
-// Enable CORS with credentials support for Next.js dev server
+// ─── Trust Proxy ──────────────────────────────────────────────────────────────
+// Required so express-rate-limit and req.ip work correctly behind Nginx / AWS ALB
+app.set('trust proxy', 1);
+
+// ─── Global Unhandled Rejection / Exception Guards ───────────────────────────
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[unhandledRejection]', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err);
+  process.exit(1); // restart via PM2 / Docker
+});
+
+// ─── HTTP Request Logging ─────────────────────────────────────────────────────
+// 'combined' (Apache format) in production → write to stdout for log aggregators
+// 'dev' (coloured) in development for readability
+app.use(morgan(isProd ? 'combined' : 'dev'));
+
+// ─── Security Headers ─────────────────────────────────────────────────────────
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+  // Strict-Transport-Security (HSTS) — only enable in production over HTTPS
+  strictTransportSecurity: isProd
+    ? { maxAge: 63072000, includeSubDomains: true, preload: true }
+    : false,
+}));
+
+// ─── Health Check ─────────────────────────────────────────────────────────────
+// Lightweight endpoint for uptime monitors and load-balancer health checks.
+// Intentionally placed BEFORE rate limiters so monitors are never throttled.
+app.get('/api/health', (req, res) => {
+  res.status(200).json({ status: 'ok', env: process.env.NODE_ENV || 'development', ts: new Date().toISOString() });
+});
+
+// ─── CORS ─────────────────────────────────────────────────────────────────────
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || process.env.CLIENT_URL || 'http://localhost:3000')
+  .split(',').map(o => o.trim());
+
 app.use(cors({
-  origin: process.env.CLIENT_URL || 'http://localhost:3000',
+  origin: (origin, cb) => {
+    // Allow server-to-server (no origin) and listed origins
+    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
+    cb(new Error(`CORS policy: origin '${origin}' not allowed`));
+  },
   credentials: true,
 }));
-app.use(express.json());
 
+// ─── Rate Limiting ────────────────────────────────────────────────────────────
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please try again later.' },
+});
+
+const strictLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please try again later.' },
+});
+
+app.use('/api/', generalLimiter);
+app.use('/api/payments/create-checkout-session', strictLimiter);
+app.use('/api/payments/purchase-credit', strictLimiter);
+app.use('/api/withdrawals', strictLimiter);
+
+// ─── Body Parser ──────────────────────────────────────────────────────────────
+app.use(express.json({ limit: '2mb' }));
+
+// ─── Input Sanitizer ──────────────────────────────────────────────────────────
+/**
+ * Strips control characters and trims a string.
+ * @param {unknown} val
+ * @param {number} [maxLen]
+ * @returns {string}
+ */
+function sanitizeStr(val, maxLen = 1000) {
+  if (typeof val !== 'string') return '';
+  // eslint-disable-next-line no-control-regex
+  return val.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '').trim().slice(0, maxLen);
+}
+
+// ─── MongoDB ──────────────────────────────────────────────────────────────────
 const uri = process.env.MONGODB_URI;
-const client = new MongoClient(uri);
+if (!uri) {
+  console.error('FATAL: MONGODB_URI is not set in environment variables.');
+  process.exit(1);
+}
+
+const mongoClient = new MongoClient(uri, {
+  serverSelectionTimeoutMS: 10000,
+  connectTimeoutMS: 10000,
+});
 
 let db;
 let campaignCollection;
@@ -22,21 +114,77 @@ let contributionCollection;
 let userCollection;
 let sessionCollection;
 
+async function createIndexes() {
+  try {
+    await campaignCollection.createIndex({ status: 1 });
+    await campaignCollection.createIndex({ creatorEmail: 1 });
+    await campaignCollection.createIndex({ createdAt: -1 });
+    await contributionCollection.createIndex({ campaignId: 1 });
+    await contributionCollection.createIndex({ supporterEmail: 1 });
+    await contributionCollection.createIndex({ status: 1 });
+    await userCollection.createIndex({ email: 1 }, { unique: true, sparse: true });
+    await userCollection.createIndex({ role: 1 });
+    await db.collection('notifications').createIndex({ toEmail: 1 });
+    await db.collection('notifications').createIndex({ time: -1 });
+    await db.collection('payments').createIndex({ userId: 1 });
+    await db.collection('payments').createIndex({ stripeSessionId: 1 }, { sparse: true });
+    await db.collection('withdrawals').createIndex({ creator_email: 1 });
+    await db.collection('withdrawals').createIndex({ status: 1 });
+    console.log('MongoDB indexes ensured.');
+  } catch (err) {
+    console.warn('Index creation warning (non-fatal):', err.message);
+  }
+}
+
 async function connectDB() {
   try {
-    await client.connect();
-    db = client.db("crowdfunding");
-    campaignCollection = db.collection("campaigns");
-    contributionCollection = db.collection("contributions");
-    userCollection = db.collection("user");
-    sessionCollection = db.collection("session");
-    console.log("Connected to MongoDB crowdfunding database");
+    await mongoClient.connect();
+    db = mongoClient.db('crowdfunding');
+    campaignCollection = db.collection('campaigns');
+    contributionCollection = db.collection('contributions');
+    userCollection = db.collection('user');
+    sessionCollection = db.collection('session');
+    console.log('Connected to MongoDB crowdfunding database');
+    await createIndexes();
+
+    // Only start listening after the DB is ready — avoids serving requests
+    // before collections are available, which would cause immediate 500s.
+    app.listen(port, () => {
+      console.log(`Express Server listening on port ${port} [${process.env.NODE_ENV || 'development'}]`);
+    });
   } catch (err) {
-    console.error("MongoDB connection failed:", err);
+    console.error('MongoDB connection failed:', err);
+    process.exit(1);
   }
 }
 
 connectDB();
+
+// ─── Graceful Shutdown ────────────────────────────────────────────────────────
+async function shutdown(signal) {
+  console.log(`${signal} received — shutting down gracefully...`);
+  try {
+    await mongoClient.close();
+    console.log('MongoDB connection closed.');
+  } catch (e) {
+    console.error('Error closing MongoDB:', e.message);
+  }
+  process.exit(0);
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT',  () => shutdown('SIGINT'));
+
+// Helper to query by ID supporting both String and ObjectId
+const getByIdQuery = (id) => {
+  if (!id) return {};
+  try {
+    const objId = new ObjectId(id);
+    return { $or: [{ _id: id }, { _id: objId }] };
+  } catch (e) {
+    return { _id: id };
+  }
+};
+
 
 // Helper to parse Session Token from Cookies or Authorization Header
 function getSessionToken(req) {
@@ -75,7 +223,7 @@ const authMiddleware = async (req, res, next) => {
     let user = await userCollection.findOne({ _id: session.userId });
     if (!user) {
       try {
-        user = await userCollection.findOne({ _id: new ObjectId(session.userId) });
+        user = await userCollection.findOne(getByIdQuery(session.userId));
       } catch (err) {}
     }
 
@@ -91,6 +239,14 @@ const authMiddleware = async (req, res, next) => {
   }
 };
 
+// Requires the authenticated user to have the 'admin' role
+const requireAdmin = (req, res, next) => {
+  if (!req.user || req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'Forbidden: Admin access required' });
+  }
+  next();
+};
+
 // Map campaign fields to standard format for the client
 const mapCampaign = (c) => {
   if (!c) return null;
@@ -99,7 +255,7 @@ const mapCampaign = (c) => {
   const deadlineDate = c.endDate || c.deadline || '';
   const imagesList = c.images || (c.campaignImage ? [c.campaignImage] : []);
   return {
-    _id: c._id.toString(),
+    _id: c._id ? c._id.toString() : null,
     title: c.title || c.campaignTitle || '',
     description: c.description || c.campaignStory || '',
     shortDescription: c.shortDescription || c.campaignStory?.substring(0, 150) || '',
@@ -156,6 +312,7 @@ app.get('/api/campaigns', async (req, res) => {
     let sortQuery = { _id: -1 };
     if (sort === 'oldest') sortQuery = { _id: 1 };
     else if (sort === 'popular') sortQuery = { backersCount: -1 };
+    else if (sort === 'most-funded') sortQuery = { currentAmount: -1, amountRaised: -1 };
 
     const total = await campaignCollection.countDocuments(query);
     const rawCampaigns = await campaignCollection.find(query)
@@ -164,7 +321,7 @@ app.get('/api/campaigns', async (req, res) => {
       .limit(limitNum)
       .toArray();
 
-    const campaigns = rawCampaigns.map(mapCampaign);
+    const campaigns = rawCampaigns.map(mapCampaign).filter(Boolean);
 
     res.json({
       campaigns,
@@ -185,24 +342,12 @@ app.get('/api/campaigns', async (req, res) => {
 app.get('/api/campaigns/my', authMiddleware, async (req, res) => {
   try {
     const email = req.user.email;
-    let count = await campaignCollection.countDocuments({ creatorEmail: email });
-    
-    // Developer Experience check: automatically assign 3 mock campaigns to this user if they don't have any
-    if (count === 0) {
-      const existing = await campaignCollection.find({ creatorEmail: { $in: ["", "emily@example.com", "michael@example.com"] } }).limit(3).toArray();
-      for (let camp of existing) {
-        await campaignCollection.updateOne(
-          { _id: camp._id },
-          { $set: { creatorEmail: email, creatorId: req.user._id.toString(), creatorName: req.user.name } }
-        );
-      }
-    }
 
     // Sort in descending order based on deadline (deadline or endDate)
     const rawCampaigns = await campaignCollection.find({ creatorEmail: email })
       .sort({ deadline: -1, endDate: -1 })
       .toArray();
-    const campaigns = rawCampaigns.map(mapCampaign);
+    const campaigns = rawCampaigns.map(mapCampaign).filter(Boolean);
     res.json({ campaigns });
   } catch (err) {
     console.error(err);
@@ -214,7 +359,7 @@ app.get('/api/campaigns/my', authMiddleware, async (req, res) => {
 app.get('/api/campaigns/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    let campaign = await campaignCollection.findOne({ _id: new ObjectId(id) });
+    let campaign = await campaignCollection.findOne(getByIdQuery(id));
     if (!campaign) {
       return res.status(404).json({ error: 'Campaign not found' });
     }
@@ -256,24 +401,47 @@ app.get('/api/campaigns/:id', async (req, res) => {
 app.post('/api/campaigns', authMiddleware, async (req, res) => {
   try {
     const { title, description, shortDescription, category, goalAmount, endDate, rewardInfo } = req.body;
+
+    // ── Input validation ──────────────────────────────────────────────────────
+    const cleanTitle = sanitizeStr(title, 200);
+    const cleanDescription = sanitizeStr(description, 10000);
+    const cleanCategory = sanitizeStr(category, 100);
+    const cleanRewardInfo = sanitizeStr(rewardInfo || '', 5000);
+
+    if (!cleanTitle) return res.status(400).json({ error: 'Campaign title is required.' });
+    if (!cleanDescription) return res.status(400).json({ error: 'Campaign description is required.' });
+    if (!cleanCategory) return res.status(400).json({ error: 'Campaign category is required.' });
+
+    const parsedGoal = Number(goalAmount);
+    if (!parsedGoal || parsedGoal <= 0 || parsedGoal > 10_000_000) {
+      return res.status(400).json({ error: 'Goal amount must be a positive number (max 10,000,000).' });
+    }
+
+    if (!endDate || isNaN(Date.parse(endDate))) {
+      return res.status(400).json({ error: 'A valid end date is required.' });
+    }
+    if (new Date(endDate) <= new Date()) {
+      return res.status(400).json({ error: 'End date must be in the future.' });
+    }
+
     const newCamp = {
       creatorId: req.user._id.toString(),
       creatorName: req.user.name,
       creatorEmail: req.user.email,
-      campaignTitle: title,
-      campaignStory: description,
-      shortDescription: shortDescription || description.substring(0, 150),
-      category: category,
-      fundingGoal: Number(goalAmount),
+      campaignTitle: cleanTitle,
+      campaignStory: cleanDescription,
+      shortDescription: sanitizeStr(shortDescription || cleanDescription.substring(0, 150), 300),
+      category: cleanCategory,
+      fundingGoal: parsedGoal,
       minimumContribution: 1,
       amountRaised: 0,
       currentAmount: 0,
-      goalAmount: Number(goalAmount),
+      goalAmount: parsedGoal,
       deadline: endDate,
       endDate: endDate,
       status: 'pending', // Visible to supporters ONLY after Admin approval
       backersCount: 0,
-      rewardInfo: rewardInfo || '',
+      rewardInfo: cleanRewardInfo,
       createdAt: new Date(),
       updatedAt: new Date(),
     };
@@ -293,7 +461,7 @@ app.put('/api/campaigns/:id', authMiddleware, async (req, res) => {
     const { id } = req.params;
     const { title, campaign_story, reward_info, description, rewardInfo } = req.body;
 
-    const campaign = await campaignCollection.findOne({ _id: new ObjectId(id) });
+    const campaign = await campaignCollection.findOne(getByIdQuery(id));
     if (!campaign) {
       return res.status(404).json({ error: 'Campaign not found' });
     }
@@ -313,11 +481,11 @@ app.put('/api/campaigns/:id', authMiddleware, async (req, res) => {
     };
 
     await campaignCollection.updateOne(
-      { _id: new ObjectId(id) },
+      getByIdQuery(id),
       { $set: updatedFields }
     );
 
-    const saved = await campaignCollection.findOne({ _id: new ObjectId(id) });
+    const saved = await campaignCollection.findOne(getByIdQuery(id));
     res.json(mapCampaign(saved));
   } catch (err) {
     console.error(err);
@@ -329,7 +497,7 @@ app.put('/api/campaigns/:id', authMiddleware, async (req, res) => {
 app.delete('/api/campaigns/:id', authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
-    const campaign = await campaignCollection.findOne({ _id: new ObjectId(id) });
+    const campaign = await campaignCollection.findOne(getByIdQuery(id));
     if (!campaign) {
       return res.status(404).json({ error: 'Campaign not found' });
     }
@@ -360,7 +528,7 @@ app.delete('/api/campaigns/:id', authMiddleware, async (req, res) => {
       if (!updateResult || updateResult.matchedCount === 0) {
         try {
           updateResult = await userCollection.updateOne(
-            { _id: new ObjectId(supporterId) },
+            getByIdQuery(supporterId),
             { $inc: { credits: refundAmount } }
           );
         } catch (e) {}
@@ -383,7 +551,7 @@ app.delete('/api/campaigns/:id', authMiddleware, async (req, res) => {
     );
 
     // Delete the campaign
-    await campaignCollection.deleteOne({ _id: new ObjectId(id) });
+    await campaignCollection.deleteOne(getByIdQuery(id));
 
     res.json({ success: true, message: 'Campaign deleted and supporters refunded successfully' });
   } catch (err) {
@@ -428,12 +596,13 @@ app.get('/api/contributions/my', authMiddleware, async (req, res) => {
       let campaign = null;
       if (c.campaignId) {
         try {
-          campaign = await campaignCollection.findOne({ _id: new ObjectId(c.campaignId) });
+          const rawCamp = await campaignCollection.findOne(getByIdQuery(c.campaignId));
+          campaign = rawCamp ? mapCampaign(rawCamp) : null;
         } catch (err) {}
       }
       contributionsWithCampaigns.push({
         ...c,
-        campaign: campaign ? mapCampaign(campaign) : null
+        campaign: campaign || null
       });
     }
 
@@ -464,38 +633,6 @@ app.get('/api/contributions/pending', authMiddleware, async (req, res) => {
     const myCampaigns = await campaignCollection.find({ creatorEmail: email }).toArray();
     const campaignIds = myCampaigns.map(c => c._id.toString());
 
-    // Seeding: Automatically generate 2 pending contributions if they don't exist for test purposes
-    const count = await contributionCollection.countDocuments({ campaignId: { $in: campaignIds }, status: 'pending' });
-    if (count === 0 && myCampaigns.length > 0) {
-      const dummy = [
-        {
-          supporterId: "supporter_test_1",
-          supporterName: "Alex Rivera",
-          supporterEmail: "alex@example.com",
-          campaignId: myCampaigns[0]._id.toString(),
-          campaignTitle: myCampaigns[0].campaignTitle || myCampaigns[0].title,
-          amount: 250,
-          message: "Absolutely thrilled to support this project! Keep going!",
-          status: "pending",
-          createdAt: new Date(Date.now() - 3600000),
-          updatedAt: new Date(Date.now() - 3600000)
-        },
-        {
-          supporterId: "supporter_test_2",
-          supporterName: "Marcus Vance",
-          supporterEmail: "marcus@example.com",
-          campaignId: (myCampaigns[1] || myCampaigns[0])._id.toString(),
-          campaignTitle: (myCampaigns[1] || myCampaigns[0]).campaignTitle || (myCampaigns[1] || myCampaigns[0]).title,
-          amount: 80,
-          message: "This is a great idea. Wishing you all the best.",
-          status: "pending",
-          createdAt: new Date(Date.now() - 7200000),
-          updatedAt: new Date(Date.now() - 7200000)
-        }
-      ];
-      await contributionCollection.insertMany(dummy);
-    }
-
     const pendingContributions = await contributionCollection.find({
       campaignId: { $in: campaignIds },
       status: 'pending'
@@ -512,7 +649,7 @@ app.get('/api/contributions/pending', authMiddleware, async (req, res) => {
 app.patch('/api/contributions/:id/approve', authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
-    const contribution = await contributionCollection.findOne({ _id: new ObjectId(id) });
+    const contribution = await contributionCollection.findOne(getByIdQuery(id));
     if (!contribution) {
       return res.status(404).json({ error: 'Contribution not found' });
     }
@@ -522,21 +659,21 @@ app.patch('/api/contributions/:id/approve', authMiddleware, async (req, res) => 
     }
 
     // Verify req.user is the owner of the campaign
-    const campaign = await campaignCollection.findOne({ _id: new ObjectId(contribution.campaignId) });
+    const campaign = await campaignCollection.findOne(getByIdQuery(contribution.campaignId));
     if (!campaign || campaign.creatorEmail !== req.user.email) {
       return res.status(403).json({ error: 'Unauthorized to approve this contribution' });
     }
 
     // Update status to approved
     await contributionCollection.updateOne(
-      { _id: new ObjectId(id) },
+      getByIdQuery(id),
       { $set: { status: 'approved', updatedAt: new Date() } }
     );
 
     // Add amount raised to campaign
     const contributionAmount = Number(contribution.amount);
     await campaignCollection.updateOne(
-      { _id: new ObjectId(contribution.campaignId) },
+      getByIdQuery(contribution.campaignId),
       { 
         $inc: { 
           amountRaised: contributionAmount, 
@@ -569,7 +706,7 @@ app.patch('/api/contributions/:id/approve', authMiddleware, async (req, res) => 
 app.patch('/api/contributions/:id/reject', authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
-    const contribution = await contributionCollection.findOne({ _id: new ObjectId(id) });
+    const contribution = await contributionCollection.findOne(getByIdQuery(id));
     if (!contribution) {
       return res.status(404).json({ error: 'Contribution not found' });
     }
@@ -579,14 +716,14 @@ app.patch('/api/contributions/:id/reject', authMiddleware, async (req, res) => {
     }
 
     // Verify req.user is the owner of the campaign
-    const campaign = await campaignCollection.findOne({ _id: new ObjectId(contribution.campaignId) });
+    const campaign = await campaignCollection.findOne(getByIdQuery(contribution.campaignId));
     if (!campaign || campaign.creatorEmail !== req.user.email) {
       return res.status(403).json({ error: 'Unauthorized to reject this contribution' });
     }
 
     // Update status to rejected
     await contributionCollection.updateOne(
-      { _id: new ObjectId(id) },
+      getByIdQuery(id),
       { $set: { status: 'rejected', updatedAt: new Date() } }
     );
 
@@ -605,7 +742,7 @@ app.patch('/api/contributions/:id/reject', authMiddleware, async (req, res) => {
     if (!updateResult || updateResult.matchedCount === 0) {
       try {
         updateResult = await userCollection.updateOne(
-          { _id: new ObjectId(supporterUserId) },
+          getByIdQuery(supporterUserId),
           { $inc: { credits: refundAmount } }
         );
       } catch (e) {}
@@ -648,7 +785,7 @@ app.get('/api/notifications', authMiddleware, async (req, res) => {
 app.patch('/api/notifications/:id/read', authMiddleware, async (req, res) => {
   try {
     await db.collection("notifications").updateOne(
-      { _id: new ObjectId(req.params.id) },
+      getByIdQuery(req.params.id),
       { $set: { read: true } }
     );
     res.json({ success: true });
@@ -786,7 +923,8 @@ app.get('/api/payments/history', authMiddleware, async (req, res) => {
       res.json(history);
     }
   } catch (err) {
-    res.json([]);
+    console.error('Payment history error:', err);
+    res.status(500).json({ error: 'Server error fetching payment history' });
   }
 });
 
@@ -811,7 +949,7 @@ app.post('/api/payments/purchase-credit', authMiddleware, async (req, res) => {
     if (!updateResult || updateResult.matchedCount === 0) {
       try {
         updateResult = await userCollection.updateOne(
-          { _id: new ObjectId(req.user._id) },
+          getByIdQuery(req.user._id),
           { $inc: { credits: creditsToPurchase } }
         );
       } catch (e) {}
@@ -835,6 +973,115 @@ app.post('/api/payments/purchase-credit', authMiddleware, async (req, res) => {
   }
 });
 
+// Create a real Stripe Checkout Session for purchasing credits
+app.post('/api/payments/create-checkout-session', authMiddleware, async (req, res) => {
+  const { price, credits } = req.body;
+  try {
+    const usdAmount = Number(price);
+    if (!usdAmount || usdAmount <= 0) {
+      return res.status(400).json({ error: 'Invalid amount' });
+    }
+    const creditsToPurchase = Number(credits !== undefined ? credits : usdAmount * 10);
+
+    const origin = req.headers.referer || req.headers.origin || 'http://localhost:3000';
+
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      line_items: [
+        {
+          price_data: {
+            currency: 'usd',
+            product_data: {
+              name: `${creditsToPurchase} Credits Wallet Upgrade`,
+              description: `Purchase of ${creditsToPurchase} credits for CrowdFund.`,
+            },
+            unit_amount: Math.round(usdAmount * 100), // in cents
+          },
+          quantity: 1,
+        },
+      ],
+      mode: 'payment',
+      success_url: `${origin.endsWith('/') ? origin.slice(0, -1) : origin}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${origin.endsWith('/') ? origin.slice(0, -1) : origin}/payment/cancel`,
+      metadata: {
+        userId: req.user._id.toString(),
+        credits: creditsToPurchase.toString(),
+        amount: usdAmount.toString(),
+      },
+    });
+
+    res.json({ id: session.id, url: session.url });
+  } catch (err) {
+    console.error('Create Stripe session error:', err);
+    // Never expose raw Stripe error messages to the client
+    res.status(500).json({ error: 'Server error creating Stripe session' });
+  }
+});
+
+// Verify Stripe Checkout Session and credit user
+app.post('/api/payments/verify-checkout-session', authMiddleware, async (req, res) => {
+  const { sessionId } = req.body;
+  try {
+    if (!sessionId) {
+      return res.status(400).json({ error: 'Session ID is required' });
+    }
+
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    if (!session) {
+      return res.status(404).json({ error: 'Stripe session not found' });
+    }
+
+    if (session.payment_status !== 'paid') {
+      return res.status(400).json({ error: 'Payment has not been completed' });
+    }
+
+    // Check if processed
+    const existingPayment = await db.collection("payments").findOne({ stripeSessionId: sessionId });
+    if (existingPayment) {
+      return res.json({ success: true, alreadyProcessed: true, credits: existingPayment.credits });
+    }
+
+    const userId = session.metadata.userId;
+    const creditsToPurchase = Number(session.metadata.credits);
+    const usdAmount = Number(session.metadata.amount);
+
+    let updateResult = null;
+    try {
+      updateResult = await userCollection.updateOne(
+        { _id: userId },
+        { $inc: { credits: creditsToPurchase } }
+      );
+    } catch (e) {}
+
+    if (!updateResult || updateResult.matchedCount === 0) {
+      try {
+        updateResult = await userCollection.updateOne(
+          getByIdQuery(userId),
+          { $inc: { credits: creditsToPurchase } }
+        );
+      } catch (e) {}
+    }
+
+    // Add to payments
+    await db.collection("payments").insertOne({
+      userId: userId,
+      userName: req.user.name,
+      amount: usdAmount,
+      credits: creditsToPurchase,
+      type: 'credit_purchase',
+      status: 'completed',
+      stripeSessionId: sessionId,
+      createdAt: new Date()
+    });
+
+    res.json({ success: true, credits: creditsToPurchase });
+  } catch (err) {
+    console.error('Verify Stripe session error:', err);
+    res.status(500).json({ error: 'Server error verifying Stripe session' });
+  }
+});
+
+
 app.post('/api/payments/create-session', authMiddleware, async (req, res) => {
   const { campaignId, amount, Contribution_amount, message, anonymous } = req.body;
   try {
@@ -843,7 +1090,14 @@ app.post('/api/payments/create-session', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'Invalid contribution amount' });
     }
 
-    const campaign = await campaignCollection.findOne({ _id: new ObjectId(campaignId) });
+    // D2: Pre-check user has sufficient credits before deducting
+    const currentUser = await userCollection.findOne(getByIdQuery(req.user._id));
+    const userCredits = Number((currentUser && currentUser.credits) || 0);
+    if (userCredits < finalAmount) {
+      return res.status(400).json({ error: `Insufficient credits. You have ${userCredits} credits but need ${finalAmount}.` });
+    }
+
+    const campaign = await campaignCollection.findOne(getByIdQuery(campaignId));
     if (!campaign) {
       return res.status(404).json({ error: 'Campaign not found' });
     }
@@ -900,7 +1154,7 @@ app.post('/api/payments/create-session', authMiddleware, async (req, res) => {
     if (!updateResult || updateResult.matchedCount === 0) {
       try {
         updateResult = await userCollection.updateOne(
-          { _id: new ObjectId(req.user._id) },
+          getByIdQuery(req.user._id),
           { $inc: { credits: -finalAmount } }
         );
       } catch (e) {}
@@ -919,7 +1173,7 @@ app.post('/api/payments/create-session', authMiddleware, async (req, res) => {
 // ──────────────────────────────────────────────────────────────────────────────
 
 // GET /api/withdrawals/pending — All pending withdrawal requests (Admin only)
-app.get('/api/withdrawals/pending', authMiddleware, async (req, res) => {
+app.get('/api/withdrawals/pending', authMiddleware, requireAdmin, async (req, res) => {
   try {
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 50;
@@ -949,12 +1203,13 @@ app.get('/api/withdrawals/pending', authMiddleware, async (req, res) => {
 });
 
 // PATCH /api/withdrawals/:id/approve — Mark withdrawal as approved & deduct credits from creator
-app.patch('/api/withdrawals/:id/approve', authMiddleware, async (req, res) => {
+// requireAdmin: only admins may approve withdrawal requests
+app.patch('/api/withdrawals/:id/approve', authMiddleware, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { adminNote } = req.body;
 
-    const withdrawal = await db.collection('withdrawals').findOne({ _id: new ObjectId(id) });
+    const withdrawal = await db.collection('withdrawals').findOne(getByIdQuery(id));
     if (!withdrawal) return res.status(404).json({ error: 'Withdrawal not found' });
     if (withdrawal.status !== 'pending') {
       return res.status(400).json({ error: 'Withdrawal is not pending' });
@@ -965,7 +1220,7 @@ app.patch('/api/withdrawals/:id/approve', authMiddleware, async (req, res) => {
 
     // Mark the withdrawal as approved
     await db.collection('withdrawals').updateOne(
-      { _id: new ObjectId(id) },
+      getByIdQuery(id),
       { $set: { status: 'approved', adminNote: adminNote || '', updatedAt: new Date() } }
     );
 
@@ -1010,19 +1265,20 @@ app.patch('/api/withdrawals/:id/approve', authMiddleware, async (req, res) => {
 });
 
 // PATCH /api/withdrawals/:id/reject — Reject a withdrawal request
-app.patch('/api/withdrawals/:id/reject', authMiddleware, async (req, res) => {
+// requireAdmin: only admins may reject withdrawal requests
+app.patch('/api/withdrawals/:id/reject', authMiddleware, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { adminNote } = req.body;
 
-    const withdrawal = await db.collection('withdrawals').findOne({ _id: new ObjectId(id) });
+    const withdrawal = await db.collection('withdrawals').findOne(getByIdQuery(id));
     if (!withdrawal) return res.status(404).json({ error: 'Withdrawal not found' });
     if (withdrawal.status !== 'pending') {
       return res.status(400).json({ error: 'Withdrawal is not pending' });
     }
 
     await db.collection('withdrawals').updateOne(
-      { _id: new ObjectId(id) },
+      getByIdQuery(id),
       { $set: { status: 'rejected', adminNote: adminNote || '', updatedAt: new Date() } }
     );
 
@@ -1051,7 +1307,7 @@ app.patch('/api/withdrawals/:id/reject', authMiddleware, async (req, res) => {
 
 
 // GET /api/admin/stats — 4 key platform statistics for the Admin Home page
-app.get('/api/admin/stats', authMiddleware, async (req, res) => {
+app.get('/api/admin/stats', authMiddleware, requireAdmin, async (req, res) => {
   try {
     // Count supporters (role === 'supporter')
     const totalSupporters = await userCollection.countDocuments({ role: 'supporter' });
@@ -1087,13 +1343,14 @@ app.get('/api/admin/stats', authMiddleware, async (req, res) => {
 });
 
 // GET /api/admin/campaigns/pending — All campaigns with status === 'pending'
-app.get('/api/admin/campaigns/pending', authMiddleware, async (req, res) => {
+app.get('/api/admin/campaigns/pending', authMiddleware, requireAdmin, async (req, res) => {
   try {
     const rawCampaigns = await campaignCollection
       .find({ status: 'pending' })
       .sort({ createdAt: -1 })
       .toArray();
-    const campaigns = rawCampaigns.map(mapCampaign);
+    // Filter out any null results from mapCampaign (e.g. corrupted docs with null _id)
+    const campaigns = rawCampaigns.map(mapCampaign).filter(Boolean);
     res.json({ campaigns });
   } catch (err) {
     console.error('Pending campaigns error:', err);
@@ -1102,16 +1359,23 @@ app.get('/api/admin/campaigns/pending', authMiddleware, async (req, res) => {
 });
 
 // PATCH /api/admin/campaigns/:id/approve — Approve a pending campaign
-app.patch('/api/admin/campaigns/:id/approve', authMiddleware, async (req, res) => {
+app.patch('/api/admin/campaigns/:id/approve', authMiddleware, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const campaign = await campaignCollection.findOne({ _id: new ObjectId(id) });
-    if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
 
-    await campaignCollection.updateOne(
-      { _id: new ObjectId(id) },
-      { $set: { status: 'approved', updatedAt: new Date() } }
+    // D3: Atomic update — only approve if still 'pending' to prevent race conditions
+    const query = { ...getByIdQuery(id), status: 'pending' };
+    const campaign = await campaignCollection.findOneAndUpdate(
+      query,
+      { $set: { status: 'approved', updatedAt: new Date() } },
+      { returnDocument: 'before' }
     );
+    if (!campaign) {
+      // Either not found or already approved/rejected by concurrent request
+      const existing = await campaignCollection.findOne(getByIdQuery(id));
+      if (!existing) return res.status(404).json({ error: 'Campaign not found' });
+      return res.status(409).json({ error: `Campaign is already '${existing.status}' — cannot approve` });
+    }
 
     // Notify the creator (new toEmail schema)
     const creatorEmail = campaign.creatorEmail;
@@ -1133,15 +1397,15 @@ app.patch('/api/admin/campaigns/:id/approve', authMiddleware, async (req, res) =
 });
 
 // PATCH /api/admin/campaigns/:id/reject — Reject a pending campaign & notify creator
-app.patch('/api/admin/campaigns/:id/reject', authMiddleware, async (req, res) => {
+app.patch('/api/admin/campaigns/:id/reject', authMiddleware, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { reason } = req.body;
-    const campaign = await campaignCollection.findOne({ _id: new ObjectId(id) });
+    const campaign = await campaignCollection.findOne(getByIdQuery(id));
     if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
 
     await campaignCollection.updateOne(
-      { _id: new ObjectId(id) },
+      getByIdQuery(id),
       { $set: { status: 'rejected', updatedAt: new Date() } }
     );
 
@@ -1166,7 +1430,7 @@ app.patch('/api/admin/campaigns/:id/reject', authMiddleware, async (req, res) =>
 });
 
 // GET /api/admin/users — All users with search, role filter, pagination
-app.get('/api/admin/users', authMiddleware, async (req, res) => {
+app.get('/api/admin/users', authMiddleware, requireAdmin, async (req, res) => {
   try {
     const { search = '', role = '', page = 1, limit = 20 } = req.query;
     const pageNum = parseInt(page);
@@ -1190,16 +1454,18 @@ app.get('/api/admin/users', authMiddleware, async (req, res) => {
       .limit(limitNum)
       .toArray();
 
-    // Map to safe fields (no password hashes etc.)
-    const users = rawUsers.map(u => ({
-      _id: u._id.toString(),
-      name: u.name || u.displayName || '',
-      email: u.email || '',
-      image: u.image || u.photoURL || u.photo_url || '',
-      role: u.role || 'supporter',
-      credits: u.credits || 0,
-      createdAt: u.createdAt || null,
-    }));
+    // Map to safe fields (no password hashes etc.); S8: null-guard _id
+    const users = rawUsers
+      .filter(u => u && u._id)
+      .map(u => ({
+        _id: u._id.toString(),
+        name: u.name || u.displayName || '',
+        email: u.email || '',
+        image: u.image || u.photoURL || u.photo_url || '',
+        role: u.role || 'supporter',
+        credits: u.credits || 0,
+        createdAt: u.createdAt || null,
+      }));
 
     res.json({
       users,
@@ -1217,7 +1483,7 @@ app.get('/api/admin/users', authMiddleware, async (req, res) => {
 });
 
 // PATCH /api/admin/users/:id/role — Update a user’s role
-app.patch('/api/admin/users/:id/role', authMiddleware, async (req, res) => {
+app.patch('/api/admin/users/:id/role', authMiddleware, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { role } = req.body;
@@ -1238,7 +1504,7 @@ app.patch('/api/admin/users/:id/role', authMiddleware, async (req, res) => {
     if (!result || result.matchedCount === 0) {
       try {
         result = await userCollection.updateOne(
-          { _id: new ObjectId(id) },
+          getByIdQuery(id),
           { $set: { role, updatedAt: new Date() } }
         );
       } catch (e) {}
@@ -1256,7 +1522,7 @@ app.patch('/api/admin/users/:id/role', authMiddleware, async (req, res) => {
 });
 
 // DELETE /api/admin/users/:id — Delete a user from the database
-app.delete('/api/admin/users/:id', authMiddleware, async (req, res) => {
+app.delete('/api/admin/users/:id', authMiddleware, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -1267,7 +1533,7 @@ app.delete('/api/admin/users/:id', authMiddleware, async (req, res) => {
 
     if (!result || result.deletedCount === 0) {
       try {
-        result = await userCollection.deleteOne({ _id: new ObjectId(id) });
+        result = await userCollection.deleteOne(getByIdQuery(id));
       } catch (e) {}
     }
 
@@ -1283,7 +1549,7 @@ app.delete('/api/admin/users/:id', authMiddleware, async (req, res) => {
 });
 
 // GET /api/admin/all-campaigns — All campaigns for admin (all statuses, paginated, searchable)
-app.get('/api/admin/all-campaigns', authMiddleware, async (req, res) => {
+app.get('/api/admin/all-campaigns', authMiddleware, requireAdmin, async (req, res) => {
   try {
     const { search = '', status = '', category = '', page = 1, limit = 15 } = req.query;
     const pageNum = parseInt(page);
@@ -1311,7 +1577,7 @@ app.get('/api/admin/all-campaigns', authMiddleware, async (req, res) => {
       .toArray();
 
     res.json({
-      campaigns: rawCampaigns.map(mapCampaign),
+      campaigns: rawCampaigns.map(mapCampaign).filter(Boolean),
       pagination: { page: pageNum, limit: limitNum, total, pages: Math.ceil(total / limitNum) || 1 },
     });
   } catch (err) {
@@ -1321,10 +1587,10 @@ app.get('/api/admin/all-campaigns', authMiddleware, async (req, res) => {
 });
 
 // DELETE /api/admin/campaigns/:id — Admin force-delete any campaign
-app.delete('/api/admin/campaigns/:id', authMiddleware, async (req, res) => {
+app.delete('/api/admin/campaigns/:id', authMiddleware, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const campaign = await campaignCollection.findOne({ _id: new ObjectId(id) });
+    const campaign = await campaignCollection.findOne(getByIdQuery(id));
     if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
 
     // Refund approved backers
@@ -1334,7 +1600,7 @@ app.delete('/api/admin/campaigns/:id', authMiddleware, async (req, res) => {
       let r = null;
       try { r = await userCollection.updateOne({ _id: contr.supporterId }, { $inc: { credits: refund } }); } catch (e) {}
       if (!r || r.matchedCount === 0) {
-        try { await userCollection.updateOne({ _id: new ObjectId(contr.supporterId) }, { $inc: { credits: refund } }); } catch (e) {}
+        try { await userCollection.updateOne(getByIdQuery(contr.supporterId), { $inc: { credits: refund } }); } catch (e) {}
       }
       await db.collection('notifications').insertOne({
         userId: contr.supporterId,
@@ -1345,7 +1611,7 @@ app.delete('/api/admin/campaigns/:id', authMiddleware, async (req, res) => {
     }
 
     await contributionCollection.updateMany({ campaignId: id }, { $set: { status: 'refunded', updatedAt: new Date() } });
-    await campaignCollection.deleteOne({ _id: new ObjectId(id) });
+    await campaignCollection.deleteOne(getByIdQuery(id));
 
     res.json({ success: true, message: 'Campaign deleted by admin' });
   } catch (err) {
@@ -1355,14 +1621,14 @@ app.delete('/api/admin/campaigns/:id', authMiddleware, async (req, res) => {
 });
 
 // PATCH /api/admin/campaigns/:id/suspend — Suspend a campaign
-app.patch('/api/admin/campaigns/:id/suspend', authMiddleware, async (req, res) => {
+app.patch('/api/admin/campaigns/:id/suspend', authMiddleware, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const campaign = await campaignCollection.findOne({ _id: new ObjectId(id) });
+    const campaign = await campaignCollection.findOne(getByIdQuery(id));
     if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
 
     await campaignCollection.updateOne(
-      { _id: new ObjectId(id) },
+      getByIdQuery(id),
       { $set: { status: 'suspended', updatedAt: new Date() } }
     );
 
@@ -1391,7 +1657,7 @@ app.patch('/api/admin/campaigns/:id/suspend', authMiddleware, async (req, res) =
 // ──────────────────────────────────────────────────────────────────────────────
 
 // GET /api/reports — Admin: list all reports with populated campaign & reporter info
-app.get('/api/reports', authMiddleware, async (req, res) => {
+app.get('/api/reports', authMiddleware, requireAdmin, async (req, res) => {
   try {
     const { status = '', page = 1, limit = 20 } = req.query;
     const pageNum = parseInt(page);
@@ -1415,7 +1681,7 @@ app.get('/api/reports', authMiddleware, async (req, res) => {
       let campaignStatus = '';
       if (r.campaignId && !campaignTitle) {
         try {
-          const camp = await campaignCollection.findOne({ _id: new ObjectId(r.campaignId) });
+          const camp = await campaignCollection.findOne(getByIdQuery(r.campaignId));
           if (camp) { campaignTitle = camp.campaignTitle || camp.title || ''; campaignStatus = camp.status; }
         } catch (e) {}
       }
@@ -1424,7 +1690,7 @@ app.get('/api/reports', authMiddleware, async (req, res) => {
       let reporterEmail = r.reporterEmail || '';
       if (r.reporterId && !reporterName) {
         try {
-          const user = await userCollection.findOne({ _id: new ObjectId(r.reporterId) });
+          const user = await userCollection.findOne(getByIdQuery(r.reporterId));
           if (user) { reporterName = user.name || ''; reporterEmail = user.email || ''; }
         } catch (e) {}
       }
@@ -1459,11 +1725,17 @@ app.get('/api/reports', authMiddleware, async (req, res) => {
 app.post('/api/reports', authMiddleware, async (req, res) => {
   try {
     const { campaignId, reason, description } = req.body;
-    if (!campaignId || !reason) return res.status(400).json({ error: 'campaignId and reason are required' });
+
+    // ── Input validation ──────────────────────────────────────────────────────
+    const cleanReason = sanitizeStr(reason, 500);
+    const cleanDescription = sanitizeStr(description || '', 3000);
+
+    if (!campaignId) return res.status(400).json({ error: 'campaignId is required' });
+    if (!cleanReason) return res.status(400).json({ error: 'reason is required (max 500 chars)' });
 
     let campaignTitle = '';
     try {
-      const camp = await campaignCollection.findOne({ _id: new ObjectId(campaignId) });
+      const camp = await campaignCollection.findOne(getByIdQuery(campaignId));
       if (camp) campaignTitle = camp.campaignTitle || camp.title || '';
     } catch (e) {}
 
@@ -1473,8 +1745,8 @@ app.post('/api/reports', authMiddleware, async (req, res) => {
       reporterId: req.user._id.toString(),
       reporterName: req.user.name || '',
       reporterEmail: req.user.email || '',
-      reason,
-      description: description || '',
+      reason: cleanReason,
+      description: cleanDescription,
       status: 'pending',
       adminNote: '',
       createdAt: new Date(),
@@ -1490,12 +1762,12 @@ app.post('/api/reports', authMiddleware, async (req, res) => {
 });
 
 // PATCH /api/reports/:id — Admin updates report status
-app.patch('/api/reports/:id', authMiddleware, async (req, res) => {
+app.patch('/api/reports/:id', authMiddleware, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { status, adminNote } = req.body;
     await db.collection('reports').updateOne(
-      { _id: new ObjectId(id) },
+      getByIdQuery(id),
       { $set: { status, adminNote: adminNote || '', updatedAt: new Date() } }
     );
     res.json({ success: true });
@@ -1505,6 +1777,5 @@ app.patch('/api/reports/:id', authMiddleware, async (req, res) => {
   }
 });
 
-app.listen(port, () => {
-  console.log(`Express Server listening on port ${port}`);
-});
+// NOTE: app.listen() has been moved inside connectDB() above so the server
+// only accepts requests after the database connection is fully established.
