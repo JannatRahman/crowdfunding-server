@@ -2,7 +2,18 @@ const express = require('express');
 const cors = require('cors');
 const { MongoClient, ObjectId } = require('mongodb');
 require('dotenv').config();
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+// Lazy-init Stripe so a missing STRIPE_SECRET_KEY never crashes module load
+// (e.g. a serverless cold start). Stripe endpoints return 501 until configured.
+let stripeClient;
+function getStripe() {
+  if (!stripeClient) {
+    if (!process.env.STRIPE_SECRET_KEY) {
+      throw new Error('STRIPE_SECRET_KEY is not set in environment variables.');
+    }
+    stripeClient = require('stripe')(process.env.STRIPE_SECRET_KEY);
+  }
+  return stripeClient;
+}
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const morgan = require('morgan');
@@ -46,14 +57,36 @@ app.get('/api/health', (req, res) => {
 });
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || process.env.CLIENT_URL || 'http://localhost:3000')
-  .split(',').map(o => o.trim());
+// Origins configured explicitly via ALLOWED_ORIGINS / CLIENT_URL env vars.
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || process.env.CLIENT_URL || '')
+  .split(',').map(o => o.trim()).filter(Boolean);
+
+// Always trust local dev plus the production / preview Vercel deployments
+// of this project, so the deployed frontend works even if ALLOWED_ORIGINS
+// has not been set in the environment yet.
+const DEFAULT_ALLOWED_ORIGINS = [
+  'http://localhost:3000',
+  'https://crowdfunding-client-flame.vercel.app',
+];
+
+// Vercel preview/alias deployments share the <project>-<hash>-<scope>.vercel.app
+// pattern — treat any such origin as trusted so preview deploys work too.
+const vercelAppPattern = /^https:\/\/[a-zA-Z0-9-]+\.vercel\.app$/;
+
+function isOriginAllowed(origin) {
+  if (!origin) return true; // server-to-server requests carry no Origin header
+  if (allowedOrigins.includes(origin)) return true;
+  if (DEFAULT_ALLOWED_ORIGINS.includes(origin)) return true;
+  return vercelAppPattern.test(origin);
+}
 
 app.use(cors({
   origin: (origin, cb) => {
-    // Allow server-to-server (no origin) and listed origins
-    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
-    cb(new Error(`CORS policy: origin '${origin}' not allowed`));
+    // Allow server-to-server (no origin) and trusted origins.
+    if (isOriginAllowed(origin)) return cb(null, true);
+    // Reject cleanly (no CORS headers → browser blocks) instead of throwing,
+    // which would surface as an opaque 500 in the browser console.
+    cb(null, false);
   },
   credentials: true,
 }));
@@ -99,7 +132,11 @@ function sanitizeStr(val, maxLen = 1000) {
 // ─── MongoDB ──────────────────────────────────────────────────────────────────
 const uri = process.env.MONGODB_URI;
 if (!uri) {
-  console.error('FATAL: MONGODB_URI is not set in environment variables.');
+  const msg = 'FATAL: MONGODB_URI is not set in environment variables.';
+  console.error(msg);
+  // process.exit() would silently kill a Vercel serverless instance mid-import;
+  // throwing surfaces a clear error in the deployment logs instead.
+  if (process.env.VERCEL === '1') throw new Error(msg);
   process.exit(1);
 }
 
@@ -137,28 +174,53 @@ async function createIndexes() {
 }
 
 async function connectDB() {
-  try {
-    await mongoClient.connect();
-    db = mongoClient.db('crowdfunding');
-    campaignCollection = db.collection('campaigns');
-    contributionCollection = db.collection('contributions');
-    userCollection = db.collection('user');
-    sessionCollection = db.collection('session');
-    console.log('Connected to MongoDB crowdfunding database');
-    await createIndexes();
-
-    // Only start listening after the DB is ready — avoids serving requests
-    // before collections are available, which would cause immediate 500s.
-    app.listen(port, () => {
-      console.log(`Express Server listening on port ${port} [${process.env.NODE_ENV || 'development'}]`);
-    });
-  } catch (err) {
-    console.error('MongoDB connection failed:', err);
-    process.exit(1);
-  }
+  await mongoClient.connect();
+  db = mongoClient.db('crowdfunding');
+  campaignCollection = db.collection('campaigns');
+  contributionCollection = db.collection('contributions');
+  userCollection = db.collection('user');
+  sessionCollection = db.collection('session');
+  console.log('Connected to MongoDB crowdfunding database');
+  await createIndexes();
+  return db;
 }
 
-connectDB();
+// ─── Vercel Serverless Support ─────────────────────────────────────────────────
+// @vercel/node requires this module to export a handler. We export a lazy async
+// handler that connects to MongoDB on the first invocation (the cached promise
+// is reused across warm invocations) and then delegates to the Express app.
+// Local / PM2 / Docker runs instead call app.listen() once the DB is ready.
+const isServerless = process.env.VERCEL === '1';
+
+if (isServerless) {
+  let dbPromise;
+  async function vercelHandler(req, res) {
+    if (!dbPromise) dbPromise = connectDB();
+    try {
+      await dbPromise;
+    } catch (err) {
+      dbPromise = undefined; // allow the next invocation to retry the connection
+      console.error('MongoDB connection failed:', err.message);
+      res.status(500).json({ error: 'Database connection failed' });
+      return;
+    }
+    app(req, res);
+  }
+  module.exports = vercelHandler;
+} else {
+  // Only start listening after the DB is ready — avoids serving requests before
+  // collections are available, which would cause immediate 500s.
+  connectDB()
+    .then(() => {
+      app.listen(port, () => {
+        console.log(`Express Server listening on port ${port} [${process.env.NODE_ENV || 'development'}]`);
+      });
+    })
+    .catch((err) => {
+      console.error('MongoDB connection failed:', err);
+      process.exit(1);
+    });
+}
 
 // ─── Graceful Shutdown ────────────────────────────────────────────────────────
 async function shutdown(signal) {
@@ -311,8 +373,9 @@ app.get('/api/campaigns', async (req, res) => {
 
     let sortQuery = { _id: -1 };
     if (sort === 'oldest') sortQuery = { _id: 1 };
-    else if (sort === 'popular') sortQuery = { backersCount: -1 };
+    else if (sort === 'popular' || sort === 'most-backed') sortQuery = { backersCount: -1 };
     else if (sort === 'most-funded') sortQuery = { currentAmount: -1, amountRaised: -1 };
+    else if (sort === 'ending-soon') sortQuery = { deadline: 1, endDate: 1 };
 
     const total = await campaignCollection.countDocuments(query);
     const rawCampaigns = await campaignCollection.find(query)
@@ -342,13 +405,29 @@ app.get('/api/campaigns', async (req, res) => {
 app.get('/api/campaigns/my', authMiddleware, async (req, res) => {
   try {
     const email = req.user.email;
+    const pageNum = Math.max(parseInt(req.query.page) || 1, 1);
+    const limitNum = Math.min(Math.max(parseInt(req.query.limit) || 10, 1), 100);
+    const skip = (pageNum - 1) * limitNum;
+
+    const query = { creatorEmail: email };
+    const total = await campaignCollection.countDocuments(query);
 
     // Sort in descending order based on deadline (deadline or endDate)
-    const rawCampaigns = await campaignCollection.find({ creatorEmail: email })
+    const rawCampaigns = await campaignCollection.find(query)
       .sort({ deadline: -1, endDate: -1 })
+      .skip(skip)
+      .limit(limitNum)
       .toArray();
     const campaigns = rawCampaigns.map(mapCampaign).filter(Boolean);
-    res.json({ campaigns });
+    res.json({
+      campaigns,
+      pagination: {
+        page: pageNum,
+        limit: limitNum,
+        total,
+        pages: Math.ceil(total / limitNum) || 1,
+      },
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Server error fetching user campaigns' });
@@ -985,7 +1064,7 @@ app.post('/api/payments/create-checkout-session', authMiddleware, async (req, re
 
     const origin = req.headers.referer || req.headers.origin || 'http://localhost:3000';
 
-    const session = await stripe.checkout.sessions.create({
+    const session = await getStripe().checkout.sessions.create({
       payment_method_types: ['card'],
       line_items: [
         {
@@ -1026,7 +1105,7 @@ app.post('/api/payments/verify-checkout-session', authMiddleware, async (req, re
       return res.status(400).json({ error: 'Session ID is required' });
     }
 
-    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    const session = await getStripe().checkout.sessions.retrieve(sessionId);
     if (!session) {
       return res.status(404).json({ error: 'Stripe session not found' });
     }
@@ -1777,5 +1856,6 @@ app.patch('/api/reports/:id', authMiddleware, requireAdmin, async (req, res) => 
   }
 });
 
-// NOTE: app.listen() has been moved inside connectDB() above so the server
-// only accepts requests after the database connection is fully established.
+// On Vercel serverless this module exports a lazy handler (see the startup
+// block near connectDB()); on local / PM2 runs app.listen() starts after the
+// database connection is fully established.
