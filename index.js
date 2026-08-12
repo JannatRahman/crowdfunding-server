@@ -386,6 +386,7 @@ app.get('/api/campaigns', async (req, res) => {
 
     const campaigns = rawCampaigns.map(mapCampaign).filter(Boolean);
 
+    res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
     res.json({
       campaigns,
       pagination: {
@@ -445,26 +446,24 @@ app.get('/api/campaigns/:id', async (req, res) => {
 
     const mapped = mapCampaign(campaign);
 
-    // Fetch creator details
-    let creator = null;
-    if (mapped.creatorEmail) {
-      creator = await userCollection.findOne({ email: mapped.creatorEmail });
-    }
+    // Fetch creator details + recent contributions in parallel to cut latency.
+    const [creatorResult, recentContributions] = await Promise.all([
+      mapped.creatorEmail
+        ? userCollection.findOne({ email: mapped.creatorEmail })
+        : Promise.resolve(null),
+      contributionCollection.find({
+        campaignId: id,
+        status: { $in: ['approved', 'pending'] }
+      }).sort({ _id: -1 }).limit(10).toArray(),
+    ]);
 
-    if (!creator) {
-      creator = {
-        name: mapped.creatorName || 'Emily Johnson',
-        email: mapped.creatorEmail || 'emily@example.com',
-        image: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb'
-      };
-    }
+    const creator = creatorResult || {
+      name: mapped.creatorName || 'Emily Johnson',
+      email: mapped.creatorEmail || 'emily@example.com',
+      image: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb'
+    };
 
-    // Fetch recent contributions
-    const recentContributions = await contributionCollection.find({ 
-      campaignId: id,
-      status: { $in: ['approved', 'pending'] }
-    }).sort({ _id: -1 }).limit(10).toArray();
-
+    res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
     res.json({
       campaign: mapped,
       creator,
